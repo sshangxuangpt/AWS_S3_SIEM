@@ -1,4 +1,4 @@
-"""FortiGate SIEM (AWS Athena) — Cortex XSOAR integration.
+"""AWS S3 Athena (SIEM) — Cortex XSOAR integration.
 
 Polls the Wayne detections table in AWS Athena for FortiGate "detection" alerts
 and, on demand, drills back to the raw FortiGate log lines that fired a detection.
@@ -464,7 +464,7 @@ def get_raw_event_command(args: dict) -> CommandResults:
         headers=["start_time", "rawstring"],
     )
     return CommandResults(
-        outputs_prefix="FortiGateSIEM.RawEvent",
+        outputs_prefix="AWSS3Athena.RawEvent",
         outputs_key_field="DedupKey",
         outputs=context,
         readable_output=readable,
@@ -510,7 +510,7 @@ def get_detections_command(args: dict) -> CommandResults:
         removeNull=True,
     )
     return CommandResults(
-        outputs_prefix="FortiGateSIEM.Detection",
+        outputs_prefix="AWSS3Athena.Detection",
         outputs_key_field="dedup_key",
         outputs=detections,
         readable_output=readable,
@@ -529,9 +529,9 @@ def main():
             return_results(test_module())
         elif command == "fetch-incidents":
             fetch_incidents()
-        elif command == "fortigate-siem-get-raw-event":
+        elif command == "aws-s3-athena-get-raw-event":
             return_results(get_raw_event_command(demisto.args()))
-        elif command == "fortigate-siem-get-detections":
+        elif command == "aws-s3-athena-get-detections":
             return_results(get_detections_command(demisto.args()))
         else:
             raise NotImplementedError(f"Command '{command}' is not implemented.")
@@ -541,7 +541,7 @@ def main():
             f"{type(e)}"
         )
     except Exception as e:  # noqa: BLE001
-        return_error(f"Error in FortiGate SIEM (AWS Athena) integration [{command}]: {e}")
+        return_error(f"Error in AWS S3 Athena (SIEM) integration [{command}]: {e}")
 
 
 if __name__ in ("__main__", "__builtin__", "builtins"):

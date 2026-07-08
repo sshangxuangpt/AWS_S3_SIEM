@@ -1,8 +1,8 @@
 commonfields:
-  id: FortiGateAthenaSIEM
+  id: AWSS3Athena
   version: -1
-name: FortiGateAthenaSIEM
-display: FortiGate SIEM (AWS Athena)
+name: AWSS3Athena
+display: AWS S3 Athena (SIEM)
 category: Analytics & SIEM
 description: |-
   Polls the Wayne detections table in AWS Athena for FortiGate detection alerts and
@@ -103,7 +103,7 @@ script:
   dockerimage: demisto/boto3py3:1.0.0.2000000
   isfetch: true
   commands:
-  - name: fortigate-siem-get-raw-event
+  - name: aws-s3-athena-get-raw-event
     description: |-
       Drill back to the raw FortiGate log lines that fired a detection. Scans GBs of
       raw logs — run it on incident-open only, never per poll. Specify the detection by
@@ -129,22 +129,22 @@ script:
       description: Maximum number of raw lines to return.
       defaultValue: "1000"
     outputs:
-    - contextPath: FortiGateSIEM.RawEvent.DedupKey
+    - contextPath: AWSS3Athena.RawEvent.DedupKey
       description: The detection dedup_key the raw events were drilled back from.
       type: String
-    - contextPath: FortiGateSIEM.RawEvent.EventCount
+    - contextPath: AWSS3Athena.RawEvent.EventCount
       description: Number of raw log lines returned.
       type: Number
-    - contextPath: FortiGateSIEM.RawEvent.Drillback
+    - contextPath: AWSS3Athena.RawEvent.Drillback
       description: The drillback recipe that was executed.
       type: Unknown
-    - contextPath: FortiGateSIEM.RawEvent.Events.start_time
+    - contextPath: AWSS3Athena.RawEvent.Events.start_time
       description: The event start time (from _time).
       type: Date
-    - contextPath: FortiGateSIEM.RawEvent.Events.rawstring
+    - contextPath: AWSS3Athena.RawEvent.Events.rawstring
       description: The raw FortiGate log line.
       type: String
-  - name: fortigate-siem-get-detections
+  - name: aws-s3-athena-get-detections
     description: Run the detections poll on demand (for manual triage / testing). Cheap — safe to run per query.
     arguments:
     - name: tenant_id
@@ -157,25 +157,25 @@ script:
     - name: limit
       description: Maximum number of detections to return.
     outputs:
-    - contextPath: FortiGateSIEM.Detection.dedup_key
+    - contextPath: AWSS3Athena.Detection.dedup_key
       description: The detection dedup key (unique id).
       type: String
-    - contextPath: FortiGateSIEM.Detection.rule_id
+    - contextPath: AWSS3Athena.Detection.rule_id
       description: The source rule id.
       type: String
-    - contextPath: FortiGateSIEM.Detection.severity
+    - contextPath: AWSS3Athena.Detection.severity
       description: The source rule severity (1-5).
       type: String
-    - contextPath: FortiGateSIEM.Detection.identity
+    - contextPath: AWSS3Athena.Detection.identity
       description: The detection identity (e.g. source IP).
       type: String
-    - contextPath: FortiGateSIEM.Detection.event_time
+    - contextPath: AWSS3Athena.Detection.event_time
       description: The activity time of the detection.
       type: Date
-    - contextPath: FortiGateSIEM.Detection.detected_at
+    - contextPath: AWSS3Athena.Detection.detected_at
       description: When the detection was raised (the fetch watermark).
       type: Date
-    - contextPath: FortiGateSIEM.Detection.evidence_count
+    - contextPath: AWSS3Athena.Detection.evidence_count
       description: The evidence count for the detection.
       type: Number
 fromversion: 6.0.0

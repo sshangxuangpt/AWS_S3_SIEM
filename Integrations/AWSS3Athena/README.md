@@ -1,4 +1,4 @@
-# FortiGate SIEM (AWS Athena) — Cortex XSOAR integration
+# AWS S3 Athena (SIEM) — Cortex XSOAR integration
 
 Turns the `xsoar_detections.ipynb` proof-of-concept into a Cortex XSOAR integration.
 It polls the Wayne **detections** table in AWS Athena for FortiGate detection "alerts",
@@ -15,9 +15,9 @@ a static IAM access key that can do nothing except assume a read-only role, then
 |---|---|
 | Auth cell (key → assume `detections-reader`) | `aws_session()` helper + instance parameters |
 | `run_sql()` | `run_sql()` (start → poll → page results) |
-| Poll cell (detections newer than `WATERMARK`) | `fetch-incidents` and `fortigate-siem-get-detections` |
+| Poll cell (detections newer than `WATERMARK`) | `fetch-incidents` and `aws-s3-athena-get-detections` |
 | `event_details` / `json.loads` | parsed into each incident's `rawJSON` |
-| Drill-back cell (`_drillback` recipe → raw logs) | `fortigate-siem-get-raw-event` |
+| Drill-back cell (`_drillback` recipe → raw logs) | `aws-s3-athena-get-raw-event` |
 
 ## Configuration
 
@@ -63,7 +63,7 @@ several detections can share the exact same `detected_at`, the last run also sto
 the boundary is emitted once and only once, and a late-arriving detection at the boundary
 timestamp is still picked up.
 
-### `fortigate-siem-get-raw-event`
+### `aws-s3-athena-get-raw-event`
 Drills back to the raw FortiGate log lines that fired a detection. **Scans GBs of raw logs —
 run on incident-open only, never per poll.** Specify the target one of three ways:
 
@@ -73,12 +73,12 @@ run on incident-open only, never per poll.** Specify the target one of three way
 3. `table` + `from_time` + `to_time` (+ optional comma-separated `like`) — build the recipe
    explicitly.
 
-Output goes to `FortiGateSIEM.RawEvent` (`DedupKey`, `EventCount`, `Drillback`, and
+Output goes to `AWSS3Athena.RawEvent` (`DedupKey`, `EventCount`, `Drillback`, and
 `Events[].{start_time, rawstring}`).
 
-### `fortigate-siem-get-detections`
+### `aws-s3-athena-get-detections`
 Runs the poll on demand for manual triage/testing (cheap). Arguments: `tenant_id`, `status`,
-`since` (e.g. `6 hours` or a timestamp), `limit`. Output goes to `FortiGateSIEM.Detection`.
+`since` (e.g. `6 hours` or a timestamp), `limit`. Output goes to `AWSS3Athena.Detection`.
 
 ## Notes carried over from the notebook
 
