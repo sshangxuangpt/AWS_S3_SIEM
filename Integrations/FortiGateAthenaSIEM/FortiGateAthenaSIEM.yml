@@ -1,0 +1,183 @@
+commonfields:
+  id: FortiGateAthenaSIEM
+  version: -1
+name: FortiGateAthenaSIEM
+display: FortiGate SIEM (AWS Athena)
+category: Analytics & SIEM
+description: |-
+  Polls the Wayne detections table in AWS Athena for FortiGate detection alerts and
+  drills back to the raw FortiGate log lines that fired a detection. Uses the same
+  two-step key -> assume-role authentication as the "AWS - Athena - Beta" content pack.
+configuration:
+- display: AWS Default Region
+  name: defaultRegion
+  type: 0
+  required: true
+  defaultvalue: ap-southeast-1
+  additionalinfo: The AWS region the Athena workgroup lives in, e.g. ap-southeast-1.
+- display: Role Arn
+  name: roleArn
+  type: 0
+  required: true
+  defaultvalue: arn:aws:iam::942510828162:role/detections-reader
+  additionalinfo: The read-only role the access key assumes (e.g. detections-reader).
+- display: Role Session Name
+  name: roleSessionName
+  type: 0
+  required: true
+  defaultvalue: xsoar-detections
+- display: Role Session Duration (seconds)
+  name: sessionDuration
+  type: 0
+  required: false
+  additionalinfo: Optional STS session duration in seconds.
+- display: Access Key
+  name: credentials
+  type: 9
+  required: true
+  displaypassword: Secret Key
+  additionalinfo: The static IAM user access key / secret key that can only assume the reader role.
+- display: Athena Workgroup
+  name: workgroup
+  type: 0
+  required: true
+  defaultvalue: wayne
+- display: Athena Database
+  name: database
+  type: 0
+  required: true
+  defaultvalue: baselines
+- display: Athena Data Catalog
+  name: catalog
+  type: 0
+  required: false
+  defaultvalue: AwsDataCatalog
+- display: Query Result S3 Output Location
+  name: outputLocation
+  type: 0
+  required: false
+  defaultvalue: s3://mss-log-fabric-8162-athena-results/wayne/
+  additionalinfo: The s3:// location Athena writes query results to. May be omitted if the workgroup enforces one.
+- display: Tenant ID
+  name: tenant_id
+  type: 0
+  required: false
+  defaultvalue: suju
+  additionalinfo: The tenant_id filter applied to the detections poll. Required for fetching incidents.
+- display: Detection status filter
+  name: detection_status
+  type: 0
+  required: false
+  defaultvalue: ES
+  additionalinfo: The detections.status value to fetch (default ES).
+- display: Fetch incidents
+  name: isFetch
+  type: 8
+  required: false
+- display: Incident type
+  name: incidentType
+  type: 13
+  required: false
+- display: First fetch timestamp (<number> <time unit>, e.g. 12 hours, 7 days) or YYYY-MM-DD HH:MM:SS
+  name: first_fetch
+  type: 0
+  required: false
+  defaultvalue: 3 days
+- display: Maximum number of incidents per fetch
+  name: max_fetch
+  type: 0
+  required: false
+  defaultvalue: "50"
+- display: Trust any certificate (not secure)
+  name: insecure
+  type: 8
+  required: false
+- display: Use system proxy settings
+  name: proxy
+  type: 8
+  required: false
+script:
+  script: '-'
+  type: python
+  subtype: python3
+  dockerimage: demisto/boto3py3:1.0.0.2000000
+  isfetch: true
+  commands:
+  - name: fortigate-siem-get-raw-event
+    description: |-
+      Drill back to the raw FortiGate log lines that fired a detection. Scans GBs of
+      raw logs — run it on incident-open only, never per poll. Specify the detection by
+      dedup_key (the recipe is looked up), by a raw drillback JSON recipe, or by explicit
+      table/from_time/to_time (+ optional like patterns).
+    arguments:
+    - name: dedup_key
+      description: The detection dedup_key. The integration looks up its _drillback recipe and runs it.
+    - name: tenant_id
+      description: Optional tenant_id to scope the dedup_key lookup. Defaults to the instance Tenant ID.
+    - name: drillback
+      description: 'A raw drillback recipe as JSON: {"table":...,"from":...,"to":...,"like":[...]}. Takes precedence over dedup_key.'
+    - name: table
+      description: Raw log table to scan (used with from_time/to_time/like when no dedup_key/drillback is given).
+    - name: from_time
+      description: Window start, 'YYYY-MM-DD HH:MM:SS'.
+    - name: to_time
+      description: Window end, 'YYYY-MM-DD HH:MM:SS'.
+    - name: like
+      description: Comma-separated list of substrings each raw message must contain (e.g. "srcip=10.0.0.1 ,dstport=161 ").
+      isArray: true
+    - name: limit
+      description: Maximum number of raw lines to return.
+      defaultValue: "1000"
+    outputs:
+    - contextPath: FortiGateSIEM.RawEvent.DedupKey
+      description: The detection dedup_key the raw events were drilled back from.
+      type: String
+    - contextPath: FortiGateSIEM.RawEvent.EventCount
+      description: Number of raw log lines returned.
+      type: Number
+    - contextPath: FortiGateSIEM.RawEvent.Drillback
+      description: The drillback recipe that was executed.
+      type: Unknown
+    - contextPath: FortiGateSIEM.RawEvent.Events.start_time
+      description: The event start time (from _time).
+      type: Date
+    - contextPath: FortiGateSIEM.RawEvent.Events.rawstring
+      description: The raw FortiGate log line.
+      type: String
+  - name: fortigate-siem-get-detections
+    description: Run the detections poll on demand (for manual triage / testing). Cheap — safe to run per query.
+    arguments:
+    - name: tenant_id
+      description: The tenant_id to poll. Defaults to the instance Tenant ID.
+    - name: status
+      description: The detections.status to fetch. Defaults to the instance setting (ES).
+    - name: since
+      description: How far back to look — '<number> <unit>' (e.g. '6 hours') or 'YYYY-MM-DD HH:MM:SS'.
+      defaultValue: 1 day
+    - name: limit
+      description: Maximum number of detections to return.
+    outputs:
+    - contextPath: FortiGateSIEM.Detection.dedup_key
+      description: The detection dedup key (unique id).
+      type: String
+    - contextPath: FortiGateSIEM.Detection.rule_id
+      description: The source rule id.
+      type: String
+    - contextPath: FortiGateSIEM.Detection.severity
+      description: The source rule severity (1-5).
+      type: String
+    - contextPath: FortiGateSIEM.Detection.identity
+      description: The detection identity (e.g. source IP).
+      type: String
+    - contextPath: FortiGateSIEM.Detection.event_time
+      description: The activity time of the detection.
+      type: Date
+    - contextPath: FortiGateSIEM.Detection.detected_at
+      description: When the detection was raised (the fetch watermark).
+      type: Date
+    - contextPath: FortiGateSIEM.Detection.evidence_count
+      description: The evidence count for the detection.
+      type: Number
+fromversion: 6.0.0
+tests:
+- No tests (auto formatted)
