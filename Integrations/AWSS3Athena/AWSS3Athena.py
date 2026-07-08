@@ -8,6 +8,14 @@ a static IAM access key that can do nothing except assume a read-only role, then
 STS assume-role into that role and talk to Athena with the temporary credentials.
 """
 
+# NOTE: `demisto` and everything from CommonServerPython (handle_proxy,
+# return_results, return_error, tableToMarkdown, CommandResults, arg_to_number,
+# arg_to_datetime, argToList, dateparser, DemistoException, LOG, ...) are
+# injected as globals by the XSOAR runtime — do NOT `import demistomock` /
+# `from CommonServerPython import *`. Those imports only resolve under the
+# demisto-sdk lint environment and raise "No module named 'demistomock'" at
+# runtime, which is exactly what the official AWS - Athena/S3/SQS integrations
+# avoid by not importing them at all.
 import json
 import time
 from datetime import datetime, date
@@ -16,10 +24,6 @@ import boto3
 import urllib3
 from botocore.config import Config
 from botocore.parsers import ResponseParserError
-
-import demistomock as demisto  # noqa: F401
-from CommonServerPython import *  # noqa: F401,F403
-from CommonServerUserPython import *  # noqa: F401,F403
 
 # Disable insecure warnings
 urllib3.disable_warnings()
