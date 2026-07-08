@@ -6,21 +6,16 @@ and, on demand, drills back to the raw FortiGate log lines that fired a detectio
 Auth is the same two-step flow the notebook / "AWS - Athena - Beta" pack use:
 a static IAM access key that can do nothing except assume a read-only role, then
 STS assume-role into that role and talk to Athena with the temporary credentials.
-
-Transport is plain HTTPS signed with AWS Signature V4 (via `requests`), so the
-integration runs on the default `demisto/python3` image — no boto3 required.
 """
 
-import hashlib
-import hmac
 import json
 import time
-import xml.etree.ElementTree as ET
-from datetime import datetime, date, timezone
-from urllib.parse import urlencode
+from datetime import datetime, date
 
-import requests
+import boto3
 import urllib3
+from botocore.config import Config
+from botocore.parsers import ResponseParserError
 
 import demistomock as demisto  # noqa: F401
 from CommonServerPython import *  # noqa: F401,F403
@@ -31,6 +26,7 @@ urllib3.disable_warnings()
 
 """ CONSTANTS """
 
+SERVICE = "athena"
 # Terminal states of an Athena query execution.
 TERMINAL_STATES = ("SUCCEEDED", "FAILED", "CANCELLED")
 # How long to poll a single Athena query before giving up (seconds).
@@ -40,12 +36,6 @@ DEFAULT_MAX_FETCH = 50
 FETCH_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 # Detected_at is what Athena hands back, e.g. "2026-07-06 01:31:16.923000".
 DETECTED_AT_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
-# HTTP (connect, read) timeouts in seconds.
-HTTP_TIMEOUT = (10, 60)
-
-STS_API_VERSION = "2011-06-15"
-ATHENA_JSON_CONTENT_TYPE = "application/x-amz-json-1.1"
-STS_FORM_CONTENT_TYPE = "application/x-www-form-urlencoded; charset=utf-8"
 
 # The source rule's own severity (OCSF severity_id, 1-5) mapped to an XSOAR
 # incident severity. See the pack README for the rationale.
@@ -77,228 +67,101 @@ def _params() -> dict:
     return demisto.params()
 
 
-""" AWS TRANSPORT (SigV4 over requests, no boto3) """
-
-
-def _sign(key: bytes, msg: str) -> bytes:
-    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
-
-
-def _signing_key(secret_key: str, datestamp: str, region: str, service: str) -> bytes:
-    k_date = _sign(("AWS4" + secret_key).encode("utf-8"), datestamp)
-    k_region = _sign(k_date, region)
-    k_service = _sign(k_region, service)
-    return _sign(k_service, "aws4_request")
-
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def sigv4_request(service, region, body, content_type, creds, verify, proxies,
-                  amz_target=None, now=None):
-    """Sign an AWS request with Signature V4 and POST it. Returns the Response.
-
-    `creds` is {access_key, secret_key, token}; `token` may be None (static key)
-    or the STS session token (temporary credentials).
-    """
-    host = f"{service}.{region}.amazonaws.com"
-    endpoint = f"https://{host}/"
-    now = now or _utcnow()
-    amzdate = now.strftime("%Y%m%dT%H%M%SZ")
-    datestamp = now.strftime("%Y%m%d")
-
-    payload_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
-
-    # Headers that are part of the signature (must be lowercase and sorted).
-    signed = {
-        "content-type": content_type,
-        "host": host,
-        "x-amz-date": amzdate,
-    }
-    if creds.get("token"):
-        signed["x-amz-security-token"] = creds["token"]
-    if amz_target:
-        signed["x-amz-target"] = amz_target
-
-    signed_headers = ";".join(sorted(signed))
-    canonical_headers = "".join(f"{k}:{signed[k]}\n" for k in sorted(signed))
-    canonical_request = "\n".join([
-        "POST", "/", "", canonical_headers, signed_headers, payload_hash,
-    ])
-
-    algorithm = "AWS4-HMAC-SHA256"
-    scope = f"{datestamp}/{region}/{service}/aws4_request"
-    string_to_sign = "\n".join([
-        algorithm,
-        amzdate,
-        scope,
-        hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
-    ])
-
-    signature = hmac.new(
-        _signing_key(creds["secret_key"], datestamp, region, service),
-        string_to_sign.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-
-    authorization = (
-        f"{algorithm} Credential={creds['access_key']}/{scope}, "
-        f"SignedHeaders={signed_headers}, Signature={signature}"
-    )
-
-    # Actual HTTP headers: everything signed except host (requests sets Host from
-    # the URL, matching what we signed), plus the Authorization header.
-    http_headers = {k: v for k, v in signed.items() if k != "host"}
-    http_headers["Authorization"] = authorization
-
-    return requests.post(
-        endpoint,
-        data=body.encode("utf-8"),
-        headers=http_headers,
-        verify=verify,
-        proxies=proxies or {},
-        timeout=HTTP_TIMEOUT,
-    )
-
-
-def _xml_find_text(root, localname):
-    """Namespace-agnostic first-match text lookup in an XML tree."""
-    for el in root.iter():
-        if el.tag.split("}")[-1] == localname:
-            return el.text
-    return None
-
-
-def assume_role(static_creds, region, role_arn, role_session_name, role_session_duration,
-                verify, proxies) -> dict:
-    """Call STS AssumeRole with the static key; return temporary credentials."""
-    form = {
-        "Action": "AssumeRole",
-        "Version": STS_API_VERSION,
-        "RoleArn": role_arn,
-        "RoleSessionName": role_session_name,
-    }
-    if role_session_duration:
-        form["DurationSeconds"] = str(int(role_session_duration))
-    body = urlencode(form)
-
-    resp = sigv4_request(
-        service="sts",
-        region=region,
-        body=body,
-        content_type=STS_FORM_CONTENT_TYPE,
-        creds=static_creds,
-        verify=verify,
+def build_config() -> Config:
+    proxies = handle_proxy(proxy_param_name="proxy", checkbox_default_value=False)
+    return Config(
+        connect_timeout=10,
+        retries={"max_attempts": 5},
         proxies=proxies,
     )
-    if resp.status_code != 200:
-        message = _xml_find_text(_safe_xml(resp.text), "Message") or resp.text
-        raise DemistoException(f"STS AssumeRole failed ({resp.status_code}): {message}")
-
-    root = ET.fromstring(resp.text)
-    access_key = _xml_find_text(root, "AccessKeyId")
-    secret_key = _xml_find_text(root, "SecretAccessKey")
-    token = _xml_find_text(root, "SessionToken")
-    if not (access_key and secret_key and token):
-        raise DemistoException("STS AssumeRole returned no credentials.")
-    return {"access_key": access_key, "secret_key": secret_key, "token": token}
 
 
-def _safe_xml(text):
-    try:
-        return ET.fromstring(text)
-    except ET.ParseError:
-        return ET.Element("empty")
+def aws_session(region=None, role_arn=None, role_session_name=None, role_session_duration=None):
+    """Return an Athena boto3 client using the two-step key -> assume-role flow.
 
-
-def get_client() -> dict:
-    """Resolve credentials (assuming the role if configured) and return a client.
-
-    The returned dict carries the effective credentials plus the region and HTTP
-    settings needed to sign every subsequent Athena call.
+    The static access key (an IAM user that can do nothing but assume the reader
+    role) is used to call STS AssumeRole; the temporary credentials returned are
+    what actually talk to Athena. Falls back to plain key auth if no role is set.
     """
     params = _params()
 
     access_key = params.get("credentials", {}).get("identifier") or params.get("access_key")
     secret_key = params.get("credentials", {}).get("password") or params.get("secret_key")
-    role_arn = params.get("roleArn")
-    role_session_name = params.get("roleSessionName") or "xsoar-detections"
-    role_session_duration = params.get("sessionDuration")
-    region = params.get("defaultRegion")
-    verify = not params.get("insecure", False)
-    proxies = handle_proxy(proxy_param_name="proxy", checkbox_default_value=False)
+    role_arn = role_arn or params.get("roleArn")
+    role_session_name = role_session_name or params.get("roleSessionName") or "xsoar-detections"
+    role_session_duration = role_session_duration or params.get("sessionDuration")
+    region = region or params.get("defaultRegion")
+    verify_certificate = not params.get("insecure", False)
+    config = build_config()
 
     if not access_key or not secret_key:
         raise DemistoException("AWS Access Key and Secret Key are required.")
-    if not region:
-        raise DemistoException("AWS Default Region is required.")
 
-    static_creds = {"access_key": access_key, "secret_key": secret_key, "token": None}
-    creds = static_creds
     if role_arn:
-        creds = assume_role(
-            static_creds, region, role_arn, role_session_name, role_session_duration,
-            verify, proxies,
+        sts_client = boto3.client(
+            service_name="sts",
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name=region,
+            verify=verify_certificate,
+            config=config,
+        )
+        assume_kwargs = {"RoleArn": role_arn, "RoleSessionName": role_session_name}
+        if role_session_duration:
+            assume_kwargs["DurationSeconds"] = int(role_session_duration)
+        creds = sts_client.assume_role(**assume_kwargs)["Credentials"]
+        return boto3.client(
+            service_name=SERVICE,
+            region_name=region,
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"],
+            verify=verify_certificate,
+            config=config,
         )
 
-    return {"region": region, "creds": creds, "verify": verify, "proxies": proxies}
-
-
-def athena_call(client: dict, action: str, payload: dict) -> dict:
-    """Invoke an Athena JSON API action (e.g. 'StartQueryExecution')."""
-    resp = sigv4_request(
-        service="athena",
-        region=client["region"],
-        body=json.dumps(payload),
-        content_type=ATHENA_JSON_CONTENT_TYPE,
-        creds=client["creds"],
-        verify=client["verify"],
-        proxies=client["proxies"],
-        amz_target=f"AmazonAthena.{action}",
+    return boto3.client(
+        service_name=SERVICE,
+        region_name=region,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        verify=verify_certificate,
+        config=config,
     )
-    if resp.status_code != 200:
-        try:
-            err = resp.json()
-            message = err.get("Message") or err.get("message") or err.get("__type") or resp.text
-        except ValueError:
-            message = resp.text
-        raise DemistoException(f"Athena {action} failed ({resp.status_code}): {message}")
-    return resp.json() if resp.text else {}
 
 
-def run_sql(client: dict, sql: str, timeout: int = DEFAULT_QUERY_TIMEOUT) -> list:
+def run_sql(client, sql: str, timeout: int = DEFAULT_QUERY_TIMEOUT) -> list:
     """Run an Athena query synchronously and return rows as a list of dicts.
 
     Mirrors the notebook's run_sql: start execution, poll until terminal, then
     page through all results. The header row becomes the dict keys.
     """
     params = _params()
+    exec_context = {
+        "Database": params.get("database") or "baselines",
+        "Catalog": params.get("catalog") or "AwsDataCatalog",
+    }
     kwargs = {
         "QueryString": sql,
-        "QueryExecutionContext": {
-            "Database": params.get("database") or "baselines",
-            "Catalog": params.get("catalog") or "AwsDataCatalog",
-        },
+        "QueryExecutionContext": exec_context,
         "WorkGroup": params.get("workgroup") or "primary",
     }
     output_location = params.get("outputLocation")
     if output_location:
         kwargs["ResultConfiguration"] = {"OutputLocation": output_location}
 
-    query_id = athena_call(client, "StartQueryExecution", kwargs)["QueryExecutionId"]
+    query_id = client.start_query_execution(**kwargs)["QueryExecutionId"]
     demisto.debug(f"Started Athena query {query_id}")
 
     deadline = time.time() + timeout
     status = {}
     while True:
-        status = athena_call(client, "GetQueryExecution", {"QueryExecutionId": query_id})[
-            "QueryExecution"]["Status"]
+        status = client.get_query_execution(QueryExecutionId=query_id)["QueryExecution"]["Status"]
         state = status["State"]
         if state in TERMINAL_STATES:
             break
         if time.time() > deadline:
-            athena_call(client, "StopQueryExecution", {"QueryExecutionId": query_id})
+            client.stop_query_execution(QueryExecutionId=query_id)
             raise DemistoException(f"Athena query {query_id} timed out after {timeout}s.")
         time.sleep(QUERY_POLL_INTERVAL)
 
@@ -312,9 +175,9 @@ def run_sql(client: dict, sql: str, timeout: int = DEFAULT_QUERY_TIMEOUT) -> lis
         page_kwargs = {"QueryExecutionId": query_id, "MaxResults": 1000}
         if token:
             page_kwargs["NextToken"] = token
-        result = athena_call(client, "GetQueryResults", page_kwargs)
+        result = client.get_query_results(**page_kwargs)
         rows += [
-            [col.get("VarCharValue") for col in row.get("Data", [])]
+            [col.get("VarCharValue") for col in row["Data"]]
             for row in result["ResultSet"]["Rows"]
         ]
         token = result.get("NextToken")
@@ -325,9 +188,6 @@ def run_sql(client: dict, sql: str, timeout: int = DEFAULT_QUERY_TIMEOUT) -> lis
         return []
     header = rows[0]
     return [dict(zip(header, row)) for row in rows[1:]]
-
-
-""" GENERAL HELPERS """
 
 
 def escape_sql_literal(value: str) -> str:
@@ -472,10 +332,10 @@ def detection_to_incident(detection: dict) -> dict:
 
 
 def test_module() -> str:
-    """Validate connectivity: assume the role and run a trivial Athena call."""
-    client = get_client()
+    """Validate connectivity: assume the role and run a trivial Athena query."""
+    client = aws_session()
     # A cheap, side-effect-free call that still exercises workgroup + role perms.
-    athena_call(client, "ListWorkGroups", {})
+    client.list_work_groups()
     params = _params()
     if params.get("isFetch"):
         # Make sure the fetch parameters at least parse.
@@ -511,7 +371,7 @@ def fetch_incidents():
             raise DemistoException("Could not parse the first fetch timestamp.")
         last_fetch = first_fetch_dt.strftime(FETCH_TIME_FORMAT)
 
-    client = get_client()
+    client = aws_session()
     detections = run_sql(client, build_poll_sql(tenant_id, status, last_fetch))
     # Stable order by detected_at so max-timestamp bookkeeping is correct.
     detections.sort(key=lambda d: d.get("detected_at") or "")
@@ -553,7 +413,7 @@ def get_raw_event_command(args: dict) -> CommandResults:
       3. table/from_time/to_time/like - build the recipe from explicit args
     """
     limit = arg_to_number(args.get("limit")) or 1000
-    client = get_client()
+    client = aws_session()
 
     drillback = None
     dedup_key = args.get("dedup_key")
@@ -625,7 +485,7 @@ def get_detections_command(args: dict) -> CommandResults:
         raise DemistoException("Could not parse the 'since' argument.")
     watermark = since_dt.strftime(FETCH_TIME_FORMAT)
 
-    client = get_client()
+    client = aws_session()
     detections = run_sql(client, build_poll_sql(tenant_id, status, watermark))
 
     limit = arg_to_number(args.get("limit"))
@@ -675,10 +535,10 @@ def main():
             return_results(get_detections_command(demisto.args()))
         else:
             raise NotImplementedError(f"Command '{command}' is not implemented.")
-    except requests.exceptions.RequestException as e:
+    except ResponseParserError as e:
         return_error(
-            "Could not connect to the AWS endpoint. Please check the region and network.\n"
-            f"{e}"
+            "Could not connect to the AWS endpoint. Please check that the region is valid.\n"
+            f"{type(e)}"
         )
     except Exception as e:  # noqa: BLE001
         return_error(f"Error in AWS S3 Athena (SIEM) integration [{command}]: {e}")
