@@ -366,18 +366,19 @@ def detection_to_incident(detection: dict) -> dict:
 
 
 def test_module() -> str:
-    """Validate connectivity: assume the role and run a trivial Athena call.
+    """Validate connectivity by assuming the role and running a trivial query.
 
-    Mirrors the official AWS packs — make a cheap, side-effect-free API call and
-    confirm AWS answered 200. Any auth/region/role problem surfaces as the
-    exception main() turns into a red test result.
+    The reader role only needs query permissions (RunQuery / GetQueryExecution /
+    GetQueryResults), not management calls like ListWorkGroups — so the test
+    runs the same start/poll/get-results path the integration actually uses on a
+    no-table 'SELECT 1'. That exercises the role, region, workgroup, database and
+    S3 output location in one shot. Any auth/region/config problem surfaces as
+    the exception main() turns into a red test result.
     """
     client = aws_session()
-    # A cheap, side-effect-free call that still exercises workgroup + role perms.
-    response = client.list_work_groups()
-    status_code = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-    if status_code != 200:
-        return f"Unexpected response from AWS Athena (HTTP {status_code})."
+    rows = run_sql(client, "SELECT 1", timeout=60)
+    if not rows:
+        return "Test query returned no rows; check the workgroup / output location configuration."
 
     params = _params()
     if params.get("isFetch"):
