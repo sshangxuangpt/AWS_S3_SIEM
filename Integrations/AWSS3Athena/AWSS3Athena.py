@@ -272,6 +272,39 @@ def map_severity(source_severity) -> float:
     return SEVERITY_MAP.get(str(source_severity).strip(), 0)
 
 
+def _maybe_json(value):
+    """Expand a value that is a JSON object/array encoded as a string.
+
+    event_details labels are all strings; the array/object-valued ones (e.g.
+    destination.ip, source.port, _drillback) are JSON *encoded as a string*
+    (double-encoded). Turn those into real lists/dicts so they are usable in
+    playbooks and render as structured, expandable data instead of one long
+    escaped string — which the War Room / context grid then visually truncates.
+    Scalars (plain IPs, numbers, timestamps) are left untouched.
+    """
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped[:1] in ("[", "{"):
+            try:
+                return json.loads(stripped)
+            except (ValueError, TypeError):
+                return value
+    return value
+
+
+def parse_event_details(event_details: str) -> dict:
+    """Parse the event_details JSON string and expand its nested JSON labels.
+
+    Two levels: event_details itself is a JSON string, and several of its label
+    values are themselves JSON strings. Both are unwrapped here so nothing shows
+    up as a truncated blob of escaped JSON downstream.
+    """
+    labels = json.loads(event_details)
+    if isinstance(labels, dict):
+        return {k: _maybe_json(v) for k, v in labels.items()}
+    return labels
+
+
 """ QUERY BUILDERS """
 
 
@@ -350,14 +383,16 @@ def detection_to_incident(detection: dict) -> dict:
     # event_details is a JSON string of the analyst variables; parse it so the
     # fields are available in the incident, and stash the drillback recipe.
     event_details = detection.get("event_details")
-    labels = {}
     if event_details:
         try:
-            labels = json.loads(event_details)
+            labels = parse_event_details(event_details)
             raw["event_details_parsed"] = labels
-            drillback_raw = labels.get("_drillback")
-            if drillback_raw:
-                raw["drillback"] = json.loads(drillback_raw)
+            # _maybe_json already expanded _drillback into a dict; surface it.
+            drillback = labels.get("_drillback") if isinstance(labels, dict) else None
+            if isinstance(drillback, str):
+                drillback = _maybe_json(drillback)
+            if drillback:
+                raw["drillback"] = drillback
         except (ValueError, TypeError):
             demisto.debug(f"Could not parse event_details for {detection.get('dedup_key')}")
 
@@ -548,11 +583,11 @@ def get_detections_command(args: dict) -> CommandResults:
     if limit:
         detections = detections[:limit]
 
-    # Parse event_details for context readability.
+    # Parse event_details for context readability (labels expanded, not truncated).
     for det in detections:
         if det.get("event_details"):
             try:
-                det["event_details_parsed"] = json.loads(det["event_details"])
+                det["event_details_parsed"] = parse_event_details(det["event_details"])
             except (ValueError, TypeError):
                 pass
 
