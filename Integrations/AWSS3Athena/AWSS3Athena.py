@@ -71,6 +71,18 @@ def _params() -> dict:
     return demisto.params()
 
 
+def detections_database() -> str:
+    """The Athena database the detections table lives in.
+
+    In the notebook this is always 'baselines' (FROM baselines.detections, and
+    QueryExecutionContext Database='baselines'). It is NOT the tenant id: 'suju'
+    is a tenant_id column value and a raw-log table prefix, never a database.
+    Setting the Athena Database instance parameter to a tenant id makes every
+    detections query fail with 'glue:GetDatabase ... database/<tenant>'.
+    """
+    return _params().get("database") or "baselines"
+
+
 def get_access_keys(params: dict):
     """Pull the AWS access key / secret key out of the instance params.
 
@@ -277,7 +289,7 @@ def build_poll_sql(tenant_id: str, status: str, watermark: str) -> str:
 SELECT dedup_key, rule_id, severity, status, identity, entity_type,
        event_time, evidence_count, window_start, window_end,
        event_details, source_event_id, detected_at
-FROM   detections
+FROM   {detections_database()}.detections
 WHERE  tenant_id = '{tenant}'
   AND  status = '{status_esc}'
   AND  detected_at >= TIMESTAMP '{watermark_esc}'
@@ -291,7 +303,7 @@ def build_detection_lookup_sql(dedup_key: str, tenant_id: str = None) -> str:
     tenant_clause = f"  AND tenant_id = '{escape_sql_literal(tenant_id)}'\n" if tenant_id else ""
     return f"""
 SELECT dedup_key, rule_id, severity, identity, event_time, event_details, detected_at
-FROM   detections
+FROM   {detections_database()}.detections
 WHERE  dedup_key = '{dedup_esc}'
 {tenant_clause}LIMIT 1
 """
