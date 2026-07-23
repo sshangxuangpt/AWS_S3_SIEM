@@ -8,6 +8,14 @@ a static IAM access key that can do nothing except assume a read-only role, then
 STS assume-role into that role and talk to Athena with the temporary credentials.
 """
 
+# NOTE: `demisto` and everything from CommonServerPython (handle_proxy,
+# return_results, return_error, tableToMarkdown, CommandResults, arg_to_number,
+# arg_to_datetime, argToList, dateparser, DemistoException, LOG, ...) are
+# injected as globals by the XSOAR runtime — do NOT `import demistomock` /
+# `from CommonServerPython import *`. Those imports only resolve under the
+# demisto-sdk lint environment and raise "No module named 'demistomock'" at
+# runtime, which is exactly what the official AWS - Athena/S3/SQS integrations
+# avoid by not importing them at all.
 import json
 import time
 from datetime import datetime, date
@@ -16,13 +24,6 @@ import boto3
 import urllib3
 from botocore.config import Config
 from botocore.parsers import ResponseParserError
-
-import demistomock as demisto  # noqa: F401
-from CommonServerPython import *  # noqa: F401,F403
-from CommonServerUserPython import *  # noqa: F401,F403
-
-# Disable insecure warnings
-urllib3.disable_warnings()
 
 """ CONSTANTS """
 
@@ -67,6 +68,37 @@ def _params() -> dict:
     return demisto.params()
 
 
+def get_access_keys(params: dict):
+    """Pull the AWS access key / secret key out of the instance params.
+
+    XSOAR's type-9 credentials field normally arrives as a dict
+    {'identifier': <access key>, 'password': <secret key>}, but depending on
+    the server/SDK version and how the credential was stored (typed inline vs.
+    selected from the credentials vault) it can instead arrive as a JSON
+    string, as None, or with the real values nested one level down. Blindly
+    calling ``params.get("credentials", {}).get("identifier")`` on any of those
+    is what raised ``'str' object has no attribute 'get'`` in test-module and
+    fetch-incidents. Normalise every shape here so callers get plain strings.
+    """
+    creds = params.get("credentials")
+    if isinstance(creds, str):
+        try:
+            creds = json.loads(creds)
+        except (ValueError, TypeError):
+            creds = {}
+    if not isinstance(creds, dict):
+        creds = {}
+
+    # A credential selected from the vault nests the real values one level down.
+    vault = creds.get("credentials")
+    if not isinstance(vault, dict):
+        vault = {}
+
+    access_key = creds.get("identifier") or vault.get("user") or params.get("access_key")
+    secret_key = creds.get("password") or vault.get("password") or params.get("secret_key")
+    return access_key, secret_key
+
+
 def build_config() -> Config:
     proxies = handle_proxy(proxy_param_name="proxy", checkbox_default_value=False)
     return Config(
@@ -85,8 +117,7 @@ def aws_session(region=None, role_arn=None, role_session_name=None, role_session
     """
     params = _params()
 
-    access_key = params.get("credentials", {}).get("identifier") or params.get("access_key")
-    secret_key = params.get("credentials", {}).get("password") or params.get("secret_key")
+    access_key, secret_key = get_access_keys(params)
     role_arn = role_arn or params.get("roleArn")
     role_session_name = role_session_name or params.get("roleSessionName") or "xsoar-detections"
     role_session_duration = role_session_duration or params.get("sessionDuration")
@@ -332,10 +363,20 @@ def detection_to_incident(detection: dict) -> dict:
 
 
 def test_module() -> str:
-    """Validate connectivity: assume the role and run a trivial Athena query."""
+    """Validate connectivity by assuming the role and running a trivial query.
+
+    The reader role only needs query permissions (RunQuery / GetQueryExecution /
+    GetQueryResults), not management calls like ListWorkGroups — so the test
+    runs the same start/poll/get-results path the integration actually uses on a
+    no-table 'SELECT 1'. That exercises the role, region, workgroup, database and
+    S3 output location in one shot. Any auth/region/config problem surfaces as
+    the exception main() turns into a red test result.
+    """
     client = aws_session()
-    # A cheap, side-effect-free call that still exercises workgroup + role perms.
-    client.list_work_groups()
+    rows = run_sql(client, "SELECT 1", timeout=60)
+    if not rows:
+        return "Test query returned no rows; check the workgroup / output location configuration."
+
     params = _params()
     if params.get("isFetch"):
         # Make sure the fetch parameters at least parse.
